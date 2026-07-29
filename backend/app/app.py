@@ -249,6 +249,68 @@ def delete_device(chip_id):
     return jsonify({'ok': True})
 
 
+@app.route('/api/devices', methods=['POST'])
+@login_required
+def create_device():
+    data = request.get_json(silent=True)
+    if not data or not data.get('chip_id'):
+        return jsonify({'error': 'chip_id is required'}), 400
+    chip_id = data['chip_id'].strip()
+    if not chip_id:
+        return jsonify({'error': 'chip_id cannot be empty'}), 400
+
+    db = get_db()
+    existing = db.execute('SELECT COUNT(*) FROM backups WHERE chip_id = ?', (chip_id,)).fetchone()
+    if existing[0] > 0:
+        return jsonify({'error': 'device already exists'}), 409
+
+    db.execute(
+        "INSERT INTO backups (chip_id, cards_json, timestamp) VALUES (?, ?, datetime('now', '+8 hours'))",
+        (chip_id, json.dumps([]))
+    )
+    db.commit()
+    return jsonify({'chip_id': chip_id}), 201
+
+
+@app.route('/api/devices/<chip_id>/cards', methods=['POST'])
+@login_required
+def upload_cards(chip_id):
+    files = request.files.getlist('files')
+    if not files or all(f.filename == '' for f in files):
+        return jsonify({'error': 'no files selected'}), 400
+
+    import hashlib
+    chip_bin_dir = os.path.join(BINS_DIR, chip_id)
+    os.makedirs(chip_bin_dir, exist_ok=True)
+
+    cards = []
+    for f in files:
+        if f.filename == '':
+            continue
+        content = f.read()
+        card_hash = hashlib.md5(content).hexdigest()[:8]
+        name = os.path.splitext(f.filename)[0]
+        safe_name = ''.join(c for c in f.filename if c.isalnum() or c in '._-')
+        f.seek(0)
+        filepath = os.path.join(chip_bin_dir, safe_name)
+        f.save(filepath)
+        cards.append({
+            'uid': card_hash,
+            'name': name,
+            'tag': 'upload',
+            'bin_url': f'/api/bins/{chip_id}/{safe_name}'
+        })
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO backups (chip_id, cards_json, timestamp) VALUES (?, ?, datetime('now', '+8 hours'))",
+        (chip_id, json.dumps(cards))
+    )
+    db.commit()
+    backup_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
+    return jsonify({'backup_id': backup_id, 'card_count': len(cards)}), 201
+
+
 @app.route('/api/bins/<chip_id>/<path:filename>')
 def download_bin(chip_id, filename):
     bin_path = os.path.join(BINS_DIR, chip_id, filename)
@@ -382,6 +444,19 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner { width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; margin: 40px auto; }
 .hidden { display: none !important; }
+.modal { position: fixed; inset: 0; z-index: 900; display: flex; align-items: center; justify-content: center; }
+.modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.4); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.modal-card { position: relative; background: var(--surface); border-radius: var(--radius); padding: 28px 24px; width: 360px; max-width: 90vw; box-shadow: 0 20px 60px rgba(0,0,0,.2); z-index: 1; }
+.modal-card h3 { font-size: 18px; font-weight: 600; margin-bottom: 20px; }
+.modal-card input { width: 100%; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 15px; outline: none; margin-bottom: 16px; }
+.modal-card input:focus { border-color: var(--accent); }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.modal-err { color: var(--danger); font-size: 13px; margin-bottom: 12px; display: none; }
+.btn-sm { padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 500; border: none; cursor: pointer; }
+.btn-sm-primary { background: var(--accent); color: #fff; }
+.btn-sm-primary:hover { background: var(--accent-hover); }
+.btn-sm-ghost { background: #f2f2f7; color: var(--text); }
+.btn-sm-ghost:hover { background: #e5e5ea; }
 </style>
 </head>
 <body>
@@ -400,13 +475,31 @@ body {
 <div class="app" id="app">
   <div class="header">
     <h1>卡片备份管理</h1>
-    <button class="logout-btn" onclick="doLogout()">退出登录</button>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn-sm btn-sm-primary" onclick="showNewDeviceModal()">新建设备</button>
+      <button class="logout-btn" onclick="doLogout()">退出登录</button>
+    </div>
   </div>
   <div class="search-bar">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
     <input type="text" id="searchInput" placeholder="搜索卡片名称或卡号..." oninput="filterCards()">
   </div>
   <div id="content"></div>
+
+<div class="modal hidden" id="newDeviceModal">
+  <div class="modal-backdrop" onclick="hideNewDeviceModal()"></div>
+  <div class="modal-card">
+    <h3>新建设备</h3>
+    <input type="text" id="newDeviceName" placeholder="输入设备名称（自定义命名）" autocomplete="off">
+    <div class="modal-err" id="newDeviceErr"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="hideNewDeviceModal()">取消</button>
+      <button class="btn btn-primary" onclick="createDevice()">创建</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="fileUploadInput" multiple style="display:none" onchange="handleFileUpload(this)">
 </div>
 
 <div class="toast" id="toast"></div>
@@ -520,6 +613,7 @@ async function loadCards() {
       html += '<div class="folder-icon" onclick="toggleFolder(\'' + fid + '\')"><svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg></div>';
       html += '<div class="folder-info" onclick="toggleFolder(\'' + fid + '\')"><div class="folder-name">' + dev.chip_id + '</div><div class="folder-meta">' + allCards.length + ' 张卡片 · 最后备份 ' + (dev.last_backup || '-') + '</div></div>';
       html += '<div class="folder-actions">';
+      html += '<button class="btn-sm btn-sm-ghost" onclick="event.stopPropagation();triggerUpload(\'' + dev.chip_id.replace(/'/g, "\\'") + '\')">上传卡片</button>';
       html += '<button class="btn-device-del" onclick="event.stopPropagation();deleteDevice(\'' + dev.chip_id + '\')">删除设备</button>';
       html += '<div class="folder-arrow" id="' + fid + '_arrow" onclick="toggleFolder(\'' + fid + '\')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></div>';
       html += '</div></div>';
@@ -582,6 +676,80 @@ async function deleteCard(backupId, idx) {
   toast('卡片已删除');
   loadCards();
 }
+
+let _pendingChipId = null;
+
+function showNewDeviceModal() {
+  document.getElementById('newDeviceModal').classList.remove('hidden');
+  document.getElementById('newDeviceName').value = '';
+  document.getElementById('newDeviceErr').style.display = 'none';
+  document.getElementById('newDeviceName').focus();
+}
+
+function hideNewDeviceModal() {
+  document.getElementById('newDeviceModal').classList.add('hidden');
+}
+
+async function createDevice() {
+  const name = document.getElementById('newDeviceName').value.trim();
+  if (!name) {
+    document.getElementById('newDeviceErr').textContent = '请输入设备名称';
+    document.getElementById('newDeviceErr').style.display = 'block';
+    return;
+  }
+  try {
+    await api('/api/devices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chip_id: name })
+    });
+    hideNewDeviceModal();
+    toast('设备已创建');
+    loadCards();
+  } catch (e) {
+    document.getElementById('newDeviceErr').textContent = e.message;
+    document.getElementById('newDeviceErr').style.display = 'block';
+  }
+}
+
+function triggerUpload(chipId) {
+  _pendingChipId = chipId;
+  document.getElementById('fileUploadInput').click();
+}
+
+async function handleFileUpload(input) {
+  const files = input.files;
+  if (!files.length || !_pendingChipId) {
+    input.value = '';
+    return;
+  }
+  const chipId = _pendingChipId;
+  _pendingChipId = null;
+  const formData = new FormData();
+  for (const f of files) {
+    formData.append('files', f);
+  }
+  try {
+    const res = await fetch('/api/devices/' + encodeURIComponent(chipId) + '/cards', {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || res.statusText);
+    }
+    const data = await res.json();
+    toast('已上传 ' + data.card_count + ' 张卡片');
+    loadCards();
+  } catch (e) {
+    toast('上传失败: ' + e.message);
+  }
+  input.value = '';
+}
+
+document.getElementById('newDeviceName').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { document.getElementById('newDeviceErr').style.display = 'none'; createDevice(); }
+});
 
 (async function init() {
   try {
