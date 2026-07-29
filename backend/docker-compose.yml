@@ -1,0 +1,9 @@
+services:
+  card-backup:
+    build: .
+    container_name: card-backup
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
