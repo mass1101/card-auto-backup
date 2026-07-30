@@ -993,17 +993,30 @@ function isTextDump(bytes) {
   return head.indexOf('+Sector:') !== -1;
 }
 
+function isDefaultKey(keyBytes) {
+  for (var i = 0; i < keyBytes.length; i++) {
+    if (keyBytes[i] !== 0xFF) return false;
+  }
+  return true;
+}
+
 function formatMifareHex(bytes) {
   var size = bytes.length;
   var sectors, blocksPerSector;
   if (size === 1024) { sectors = 16; blocksPerSector = 4; }
   else if (size === 4096) { sectors = 40; blocksPerSector = function(s) { return s < 32 ? 4 : 16; }; }
-  else return formatHex(bytes);
+  else return {html: formatHex(bytes), encrypted: 0, total: 0};
 
+  var encrypted = 0;
   var html = '<div style="color:#64748b;margin-bottom:12px">Mifare Classic ' + (size === 1024 ? '1K' : '4K') + ' | ' + sectors + '扇区 | ' + size + '字节</div>';
   var offset = 0;
   for (var s = 0; s < sectors; s++) {
     var bps = typeof blocksPerSector === 'function' ? blocksPerSector(s) : blocksPerSector;
+    var trailerOffset = offset + (bps - 1) * 16;
+    var trailer = bytes.slice(trailerOffset, trailerOffset + 16);
+    var keyA = trailer.slice(0, 6);
+    var keyB = trailer.slice(10, 16);
+    if (!isDefaultKey(keyA) || !isDefaultKey(keyB)) encrypted++;
     html += '<div style="margin-bottom:12px">';
     html += '<div style="color:#38bdf8;font-size:13px;font-weight:600;margin-bottom:6px">' + s + '扇区</div>';
     for (var b = 0; b < bps; b++) {
@@ -1016,7 +1029,7 @@ function formatMifareHex(bytes) {
     }
     html += '</div>';
   }
-  return html;
+  return {html: html, encrypted: encrypted, total: sectors};
 }
 
 function formatHex(bytes) {
@@ -1032,7 +1045,8 @@ function formatHex(bytes) {
 }
 
 async function previewCard(binUrl, name, uid) {
-  document.getElementById('cardPreviewTitle').textContent = (name || uid || '卡片') + ' 数据';
+  var title = (name || uid || '卡片') + ' 数据';
+  document.getElementById('cardPreviewTitle').textContent = title;
   var div = document.getElementById('cardPreviewHex');
   if (!binUrl) {
     div.innerHTML = '<div style="color:#64748b;padding:20px;text-align:center">无二进制数据</div>';
@@ -1046,7 +1060,11 @@ async function previewCard(binUrl, name, uid) {
       if (isTextDump(bytes)) {
         bytes = parseChameleonDump(new TextDecoder().decode(bytes));
       }
-      div.innerHTML = formatMifareHex(bytes);
+      var result = formatMifareHex(bytes);
+      div.innerHTML = result.html;
+      if (result.total > 0) {
+        document.getElementById('cardPreviewTitle').textContent = title + ' (' + result.total + '扇区, 加密' + result.encrypted + ', 不加密' + (result.total - result.encrypted) + ')';
+      }
     } catch(e) {
       div.innerHTML = '<div style="color:#f87171;padding:20px;text-align:center">加载失败: ' + e.message + '</div>';
     }
