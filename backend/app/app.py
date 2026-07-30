@@ -5,6 +5,7 @@ import json
 import base64
 import io
 import secrets
+import hashlib
 from functools import wraps
 
 app = Flask(__name__)
@@ -36,6 +37,22 @@ def init_db():
         ''')
         db.execute('CREATE INDEX IF NOT EXISTS idx_backups_chip_id ON backups(chip_id)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_backups_timestamp ON backups(timestamp)')
+        try:
+            db.execute('ALTER TABLE backups ADD COLUMN created_by TEXT DEFAULT ''admin''')
+        except:
+            pass
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        existing = db.execute('SELECT COUNT(*) FROM users').fetchone()
+        if existing[0] == 0:
+            db.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)',
+                       ('admin', hashlib.sha256('xiang1101'.encode()).hexdigest()))
         db.commit()
 
 
@@ -56,17 +73,28 @@ def login_required(f):
     return decorated
 
 
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'xiang1101'
 AUTH_TOKEN = secrets.token_hex(32)
+
+
+def get_current_user():
+    return request.cookies.get('username', 'admin')
+
+
+def is_admin():
+    return get_current_user() == 'admin'
 
 
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json(silent=True) or {}
-    if data.get('username') == ADMIN_USER and data.get('password') == ADMIN_PASS:
-        resp = make_response(jsonify({'ok': True}))
+    username = data.get('username', '')
+    password = data.get('password', '')
+    db = get_db()
+    row = db.execute('SELECT password_hash FROM users WHERE username = ?', (username,)).fetchone()
+    if row and row['password_hash'] == hashlib.sha256(password.encode()).hexdigest():
+        resp = make_response(jsonify({'ok': True, 'username': username}))
         resp.set_cookie('auth_token', AUTH_TOKEN, httponly=True, samesite='Strict')
+        resp.set_cookie('username', username, samesite='Strict')
         return resp
     return jsonify({'error': '用户名或密码错误'}), 401
 
@@ -81,7 +109,58 @@ def logout():
 @app.route('/api/session', methods=['GET'])
 def check_session():
     token = request.cookies.get('auth_token')
-    return jsonify({'logged_in': token == AUTH_TOKEN})
+    username = get_current_user()
+    return jsonify({'logged_in': token == AUTH_TOKEN, 'username': username, 'is_admin': username == 'admin'})
+
+
+@app.route('/api/users', methods=['GET'])
+@login_required
+def list_users():
+    if not is_admin():
+        return jsonify({'error': 'unauthorized'}), 403
+    db = get_db()
+    rows = db.execute('SELECT id, username, created_at FROM users ORDER BY id').fetchall()
+    users = [{'id': r['id'], 'username': r['username'], 'created_at': r['created_at']} for r in rows]
+    return jsonify(users)
+
+
+@app.route('/api/users', methods=['POST'])
+@login_required
+def add_user():
+    if not is_admin():
+        return jsonify({'error': 'unauthorized'}), 403
+    data = request.get_json(silent=True) or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    if not username or not password:
+        return jsonify({'error': '用户名和密码不能为空'}), 400
+    if len(password) < 4:
+        return jsonify({'error': '密码至少4位'}), 400
+    db = get_db()
+    existing = db.execute('SELECT COUNT(*) FROM users WHERE username = ?', (username,)).fetchone()
+    if existing[0] > 0:
+        return jsonify({'error': '用户名已存在'}), 409
+    db.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)',
+               (username, hashlib.sha256(password.encode()).hexdigest()))
+    db.commit()
+    return jsonify({'ok': True}), 201
+
+
+@app.route('/api/users/<username>', methods=['DELETE'])
+@login_required
+def delete_user(username):
+    if not is_admin():
+        return jsonify({'error': 'unauthorized'}), 403
+    db = get_db()
+    row = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+    if not row:
+        return jsonify({'error': '用户不存在'}), 404
+    count = db.execute('SELECT COUNT(*) FROM users').fetchone()
+    if count[0] <= 1:
+        return jsonify({'error': '不能删除最后一个用户'}), 400
+    db.execute('DELETE FROM users WHERE id = ?', (row['id'],))
+    db.commit()
+    return jsonify({'ok': True})
 
 
 @app.route('/api/backup', methods=['POST'])
@@ -123,8 +202,8 @@ def receive_backup():
 
     db = get_db()
     db.execute(
-        "INSERT INTO backups (chip_id, cards_json, timestamp) VALUES (?, ?, datetime('now', '+8 hours'))",
-        (chip_id, json.dumps(cards_stored))
+        "INSERT INTO backups (chip_id, cards_json, timestamp, created_by) VALUES (?, ?, datetime('now', '+8 hours'), ?)",
+        (chip_id, json.dumps(cards_stored), get_current_user())
     )
     db.commit()
     backup_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -135,15 +214,27 @@ def receive_backup():
 @app.route('/api/devices', methods=['GET'])
 def list_devices():
     db = get_db()
-    rows = db.execute('''
-        SELECT chip_id,
-               MAX(timestamp) as last_backup,
-               (SELECT cards_json FROM backups b2 WHERE b2.chip_id = b.chip_id ORDER BY b2.timestamp DESC LIMIT 1) as latest_cards,
-               COUNT(*) as backup_count
-        FROM backups b
-        GROUP BY chip_id
-        ORDER BY last_backup DESC
-    ''').fetchall()
+    if is_admin():
+        rows = db.execute('''
+            SELECT chip_id,
+                   MAX(timestamp) as last_backup,
+                   (SELECT cards_json FROM backups b2 WHERE b2.chip_id = b.chip_id ORDER BY b2.timestamp DESC LIMIT 1) as latest_cards,
+                   COUNT(*) as backup_count
+            FROM backups b
+            GROUP BY chip_id
+            ORDER BY last_backup DESC
+        ''').fetchall()
+    else:
+        rows = db.execute('''
+            SELECT chip_id,
+                   MAX(timestamp) as last_backup,
+                   (SELECT cards_json FROM backups b2 WHERE b2.chip_id = b.chip_id ORDER BY b2.timestamp DESC LIMIT 1) as latest_cards,
+                   COUNT(*) as backup_count
+            FROM backups b
+            WHERE created_by = ?
+            GROUP BY chip_id
+            ORDER BY last_backup DESC
+        ''', (get_current_user(),)).fetchall()
 
     devices = []
     for row in rows:
@@ -160,10 +251,16 @@ def list_devices():
 @app.route('/api/backups/<chip_id>', methods=['GET'])
 def device_backups(chip_id):
     db = get_db()
-    rows = db.execute(
-        'SELECT id, timestamp, cards_json FROM backups WHERE chip_id = ? ORDER BY timestamp DESC',
-        (chip_id,)
-    ).fetchall()
+    if is_admin():
+        rows = db.execute(
+            'SELECT id, timestamp, cards_json FROM backups WHERE chip_id = ? ORDER BY timestamp DESC',
+            (chip_id,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            'SELECT id, timestamp, cards_json FROM backups WHERE chip_id = ? AND created_by = ? ORDER BY timestamp DESC',
+            (chip_id, get_current_user())
+        ).fetchall()
 
     backups = []
     for row in rows:
@@ -186,9 +283,11 @@ def admin():
 @login_required
 def delete_backup(backup_id):
     db = get_db()
-    row = db.execute('SELECT chip_id, cards_json FROM backups WHERE id = ?', (backup_id,)).fetchone()
+    row = db.execute('SELECT chip_id, cards_json, created_by FROM backups WHERE id = ?', (backup_id,)).fetchone()
     if not row:
         return jsonify({'error': 'not found'}), 404
+    if not is_admin() and row['created_by'] != get_current_user():
+        return jsonify({'error': 'unauthorized'}), 403
     cards = json.loads(row['cards_json'])
     for card in cards:
         bin_url = card.get('bin_url', '')
@@ -206,9 +305,11 @@ def delete_backup(backup_id):
 @login_required
 def delete_card(backup_id, card_index):
     db = get_db()
-    row = db.execute('SELECT chip_id, cards_json FROM backups WHERE id = ?', (backup_id,)).fetchone()
+    row = db.execute('SELECT chip_id, cards_json, created_by FROM backups WHERE id = ?', (backup_id,)).fetchone()
     if not row:
         return jsonify({'error': 'not found'}), 404
+    if not is_admin() and row['created_by'] != get_current_user():
+        return jsonify({'error': 'unauthorized'}), 403
     cards = json.loads(row['cards_json'])
     if card_index < 0 or card_index >= len(cards):
         return jsonify({'error': 'invalid card index'}), 400
@@ -228,7 +329,11 @@ def delete_card(backup_id, card_index):
 @login_required
 def delete_device(chip_id):
     db = get_db()
-    rows = db.execute('SELECT id, cards_json FROM backups WHERE chip_id = ?', (chip_id,)).fetchall()
+    rows = db.execute('SELECT id, cards_json, created_by FROM backups WHERE chip_id = ?', (chip_id,)).fetchall()
+    if rows and not is_admin():
+        for row in rows:
+            if row['created_by'] != get_current_user():
+                return jsonify({'error': 'unauthorized'}), 403
     for row in rows:
         cards = json.loads(row['cards_json'])
         for card in cards:
@@ -250,7 +355,6 @@ def delete_device(chip_id):
 
 
 @app.route('/api/devices', methods=['POST'])
-@login_required
 def create_device():
     data = request.get_json(silent=True)
     if not data or not data.get('chip_id'):
@@ -262,18 +366,17 @@ def create_device():
     db = get_db()
     existing = db.execute('SELECT COUNT(*) FROM backups WHERE chip_id = ?', (chip_id,)).fetchone()
     if existing[0] > 0:
-        return jsonify({'error': 'device already exists'}), 409
+        return jsonify({'error': '设备名已存在'}), 409
 
     db.execute(
-        "INSERT INTO backups (chip_id, cards_json, timestamp) VALUES (?, ?, datetime('now', '+8 hours'))",
-        (chip_id, json.dumps([]))
+        "INSERT INTO backups (chip_id, cards_json, timestamp, created_by) VALUES (?, ?, datetime('now', '+8 hours'), ?)",
+        (chip_id, json.dumps([]), get_current_user())
     )
     db.commit()
     return jsonify({'chip_id': chip_id}), 201
 
 
 @app.route('/api/devices/<chip_id>/cards', methods=['POST'])
-@login_required
 def upload_cards(chip_id):
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
@@ -294,17 +397,24 @@ def upload_cards(chip_id):
         f.seek(0)
         filepath = os.path.join(chip_bin_dir, safe_name)
         f.save(filepath)
+        size = len(content)
+        if size == 5:
+            tag = '100'
+        elif size in (256, 512, 1024, 2048, 4096):
+            tag = '1001'
+        else:
+            tag = '手动上传'
         cards.append({
             'uid': card_hash,
             'name': name,
-            'tag': 'upload',
+            'tag': tag,
             'bin_url': f'/api/bins/{chip_id}/{safe_name}'
         })
 
     db = get_db()
     db.execute(
-        "INSERT INTO backups (chip_id, cards_json, timestamp) VALUES (?, ?, datetime('now', '+8 hours'))",
-        (chip_id, json.dumps(cards))
+        "INSERT INTO backups (chip_id, cards_json, timestamp, created_by) VALUES (?, ?, datetime('now', '+8 hours'), ?)",
+        (chip_id, json.dumps(cards), get_current_user())
     )
     db.commit()
     backup_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -476,6 +586,8 @@ body {
   <div class="header">
     <h1>卡片备份管理</h1>
     <div style="display:flex;gap:10px;align-items:center">
+      <span id="headerUser" style="font-size:13px;color:var(--text-secondary)"></span>
+      <button class="btn-sm btn-sm-ghost" id="btnUserMgmt" onclick="showUserModal()" style="display:none">用户管理</button>
       <button class="btn-sm btn-sm-primary" onclick="showNewDeviceModal()">新建设备</button>
       <button class="logout-btn" onclick="doLogout()">退出登录</button>
     </div>
@@ -499,6 +611,34 @@ body {
   </div>
 </div>
 
+<div class="modal hidden" id="cardPreviewModal">
+  <div class="modal-backdrop" onclick="hideCardPreview()"></div>
+  <div class="modal-card" style="width:750px;max-width:95vw;max-height:80vh;overflow-y:auto">
+    <h3 id="cardPreviewTitle">卡片数据</h3>
+    <div id="cardPreviewHex" style="font-family:monospace;font-size:12px;line-height:1.7;background:#1e293b;color:#e2e8f0;padding:16px;border-radius:10px;overflow-x:auto;min-height:60px"></div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ghost" onclick="hideCardPreview()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="userModal">
+  <div class="modal-backdrop" onclick="hideUserModal()"></div>
+  <div class="modal-card" style="width:400px;max-width:90vw">
+    <h3>用户管理</h3>
+    <div id="userList" style="margin-bottom:16px"></div>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="newUsername" placeholder="新用户名" autocomplete="off" style="flex:1;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none">
+      <input type="password" id="newPassword" placeholder="密码" autocomplete="off" style="flex:1;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none">
+      <button class="btn btn-primary" onclick="addUser()" style="flex-shrink:0">添加</button>
+    </div>
+    <div class="modal-err" id="userErr"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="hideUserModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
 <input type="file" id="fileUploadInput" multiple style="display:none" onchange="handleFileUpload(this)">
 </div>
 
@@ -506,6 +646,10 @@ body {
 
 <script>
 let _allDevices = [];
+
+function escapeHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -524,7 +668,13 @@ async function doLogin() {
   const u = document.getElementById('loginUser').value;
   const p = document.getElementById('loginPass').value;
   try {
-    await api('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+    const r = await api('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+    document.getElementById('headerUser').textContent = r.username;
+    if (r.username === 'admin') {
+      document.getElementById('btnUserMgmt').style.display = '';
+    } else {
+      document.getElementById('btnUserMgmt').style.display = 'none';
+    }
     document.getElementById('loginOverlay').style.display = 'none';
     document.getElementById('app').classList.add('visible');
     loadCards();
@@ -553,6 +703,7 @@ function tagLabel(tag) {
   const n = parseInt(t);
   if (n === 1001) return { text: 'IC', cls: 'tag-ic' };
   if (n === 100) return { text: 'ID', cls: 'tag-id' };
+  if (t.includes('手动') || t.includes('upload')) return { text: '上传', cls: 'tag-other' };
   if (n >= 0 && n <= 3) return { text: 'IC', cls: 'tag-ic' };
   return { text: tag || '-', cls: 'tag-other' };
 }
@@ -606,30 +757,36 @@ async function loadCards() {
           allCards.push({ ...c, _backup_time: b.timestamp, _backup_id: b.id, _card_index: ci });
         }
       }
-      if (!allCards.length) continue;
       const fid = 'f' + dev.chip_id.replace(/[^a-zA-Z0-9]/g, '_');
       html += '<div class="folder" id="' + fid + '_folder">';
       html += '<div class="folder-header">';
       html += '<div class="folder-icon" onclick="toggleFolder(\'' + fid + '\')"><svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg></div>';
-      html += '<div class="folder-info" onclick="toggleFolder(\'' + fid + '\')"><div class="folder-name">' + dev.chip_id + '</div><div class="folder-meta">' + allCards.length + ' 张卡片 · 最后备份 ' + (dev.last_backup || '-') + '</div></div>';
+      html += '<div class="folder-info" onclick="toggleFolder(\'' + fid + '\')"><div class="folder-name">' + escapeHtml(dev.chip_id) + '</div><div class="folder-meta">' + allCards.length + ' 张卡片 · 最后备份 ' + (dev.last_backup || '-') + '</div></div>';
       html += '<div class="folder-actions">';
-      html += '<button class="btn-sm btn-sm-ghost" onclick="event.stopPropagation();triggerUpload(\'' + dev.chip_id.replace(/'/g, "\\'") + '\')">上传卡片</button>';
-      html += '<button class="btn-device-del" onclick="event.stopPropagation();deleteDevice(\'' + dev.chip_id + '\')">删除设备</button>';
+      const escChipId = dev.chip_id.replace(/'/g, "\\'");
+      html += '<button class="btn-sm btn-sm-ghost" onclick="event.stopPropagation();triggerUpload(\'' + escChipId + '\')">上传卡片</button>';
+      html += '<button class="btn-device-del" onclick="event.stopPropagation();deleteDevice(\'' + escChipId + '\')">删除设备</button>';
       html += '<div class="folder-arrow" id="' + fid + '_arrow" onclick="toggleFolder(\'' + fid + '\')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></div>';
       html += '</div></div>';
       html += '<div class="folder-body" id="' + fid + '_body" style="display:none"><div class="card-list">';
       const cardEls = [];
+      if (allCards.length === 0) {
+        html += '<div style="padding:20px;color:var(--text-secondary);font-size:14px;text-align:center">暂无卡片，点击上方"上传卡片"添加</div>';
+      }
       for (let i = 0; i < allCards.length; i++) {
         const card = allCards[i];
         const ci = 'c' + fid + '_' + i;
         const tag = tagLabel(card.tag || card.tag_type);
-        html += '<div class="card-item" id="' + ci + '">';
+        const binUrl = (card.bin_url || '').replace(/"/g, '&quot;');
+        const escName = (card.name || '').replace(/"/g, '&quot;');
+        const escUid = (card.uid || '').replace(/"/g, '&quot;');
+        html += '<div class="card-item" id="' + ci + '" data-bin-url="' + binUrl + '" data-name="' + escName + '" data-uid="' + escUid + '" style="cursor:pointer">';
         html += '<div class="card-info"><div class="name">' + (card.name || '-') + '</div><div class="meta">' + (card.uid || '-') + ' | 备份时间: ' + (card._backup_time || '-') + '</div></div>';
         html += '<div class="card-actions"><span class="tag-badge ' + tag.cls + '">' + tag.text + '</span>';
         if (card.bin_url) {
-          html += '<a href="' + encodeURI(card.bin_url) + '" class="btn btn-primary" style="font-size:13px;padding:6px 14px">下载 .bin</a>';
+          html += '<a href="' + encodeURI(card.bin_url) + '" class="btn btn-primary" style="font-size:13px;padding:6px 14px" onclick="event.stopPropagation()">下载 .bin</a>';
         }
-        html += '<button class="btn btn-danger" onclick="deleteCard(' + card._backup_id + ',' + card._card_index + ')">删除</button>';
+        html += '<button class="btn btn-danger" onclick="event.stopPropagation();deleteCard(' + card._backup_id + ',' + card._card_index + ')">删除</button>';
         html += '</div></div>';
         cardEls.push(ci);
       }
@@ -645,9 +802,19 @@ async function loadCards() {
       }
     }
   } catch(e) {
-    document.getElementById('content').innerHTML = '<div class="empty-state"><div style="font-size:16px">加载失败</div></div>';
+    document.getElementById('content').innerHTML = '<div class="empty-state"><div style="font-size:16px">加载失败</div><div style="font-size:13px;color:var(--text-secondary);margin-top:8px">' + escapeHtml(e.message) + '</div></div>';
   }
 }
+
+document.getElementById('content').addEventListener('click', function(e) {
+  const cardItem = e.target.closest('.card-item');
+  if (!cardItem) return;
+  previewCard(
+    cardItem.dataset.binUrl,
+    cardItem.dataset.name,
+    cardItem.dataset.uid
+  );
+});
 
 function toggleFolder(fid) {
   const body = document.getElementById(fid + '_body');
@@ -707,7 +874,12 @@ async function createDevice() {
     toast('设备已创建');
     loadCards();
   } catch (e) {
-    document.getElementById('newDeviceErr').textContent = e.message;
+    const msg = e.message;
+    if (msg === 'unauthorized') {
+      hideNewDeviceModal();
+      return;
+    }
+    document.getElementById('newDeviceErr').textContent = msg;
     document.getElementById('newDeviceErr').style.display = 'block';
   }
 }
@@ -751,10 +923,213 @@ document.getElementById('newDeviceName').addEventListener('keydown', e => {
   if (e.key === 'Enter') { document.getElementById('newDeviceErr').style.display = 'none'; createDevice(); }
 });
 
+function hexByte(b) { return b.toString(16).padStart(2, '0'); }
+
+function colorByte(b, color) {
+  return '<span style="color:' + color + '">' + hexByte(b) + '</span>';
+}
+
+function formatBlock(block, blockIdx, sectorIdx, totalSectors) {
+  const isTrailer = (blockIdx === 3) || (sectorIdx >= 32 && blockIdx === 15);
+  var html = '<div style="display:flex;gap:8px"><span style="color:#64748b;min-width:60px;text-align:right;flex-shrink:0">' + blockIdx + '区块:</span><span>';
+  for (var j = 0; j < block.length; j++) {
+    var b = block[j];
+    var color = null;
+    if (sectorIdx === 0 && blockIdx === 0) {
+      if (j <= 3) color = '#60a5fa';
+    }
+    if (isTrailer) {
+      if (j <= 5) color = '#f87171';
+      else if (j <= 8) color = '#fbbf24';
+      else if (j >= 10) color = '#22d3ee';
+    }
+    if (color) {
+      html += colorByte(b, color);
+    } else {
+      html += hexByte(b);
+    }
+    if (j < block.length - 1) html += ' ';
+  }
+  html += '</span></div>';
+  return html;
+}
+
+function isAllFF(block) {
+  for (var i = 0; i < block.length; i++) {
+    if (block[i] !== 0xFF) return false;
+  }
+  return true;
+}
+
+function isAll00(block) {
+  for (var i = 0; i < block.length; i++) {
+    if (block[i] !== 0x00) return false;
+  }
+  return true;
+}
+
+function parseChameleonDump(text) {
+  var lines = text.split('\n');
+  var allBytes = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (line.length === 0) continue;
+    if (line.startsWith('+Sector:')) continue;
+    if (/^[0-9A-Fa-f]+$/.test(line) && line.length >= 32) {
+      for (var j = 0; j < line.length; j += 2) {
+        allBytes.push(parseInt(line.substring(j, j + 2), 16));
+      }
+    }
+  }
+  return new Uint8Array(allBytes);
+}
+
+function isTextDump(bytes) {
+  if (bytes.length < 8) return false;
+  for (var i = 0; i < Math.min(bytes.length, 64); i++) {
+    if (bytes[i] === 0) return false;
+  }
+  var head = String.fromCharCode.apply(null, Array.from(bytes.slice(0, 200)));
+  return head.indexOf('+Sector:') !== -1;
+}
+
+function formatMifareHex(bytes) {
+  var size = bytes.length;
+  var sectors, blocksPerSector;
+  if (size === 1024) { sectors = 16; blocksPerSector = 4; }
+  else if (size === 4096) { sectors = 40; blocksPerSector = function(s) { return s < 32 ? 4 : 16; }; }
+  else return formatHex(bytes);
+
+  var html = '<div style="color:#64748b;margin-bottom:12px">Mifare Classic ' + (size === 1024 ? '1K' : '4K') + ' | ' + sectors + '扇区 | ' + size + '字节</div>';
+  var offset = 0;
+  for (var s = 0; s < sectors; s++) {
+    var bps = typeof blocksPerSector === 'function' ? blocksPerSector(s) : blocksPerSector;
+    html += '<div style="margin-bottom:12px">';
+    html += '<div style="color:#38bdf8;font-size:13px;font-weight:600;margin-bottom:6px">' + s + '扇区</div>';
+    for (var b = 0; b < bps; b++) {
+      var block = bytes.slice(offset, offset + 16);
+      offset += 16;
+      var dim = '';
+      if (isAll00(block)) dim = ';opacity:0.4';
+      else if (isAllFF(block)) dim = ';opacity:0.5';
+      html += '<div style="padding:2px 0' + dim + '">' + formatBlock(block, b, s, sectors) + '</div>';
+    }
+    html += '</div>';
+  }
+  return html;
+}
+
+function formatHex(bytes) {
+  var lines = [];
+  for (var i = 0; i < bytes.length; i += 16) {
+    var offset = i.toString(16).padStart(6, '0');
+    var chunk = bytes.slice(i, i + 16);
+    var hex = Array.from(chunk, function(b) { return b.toString(16).padStart(2, '0'); }).join(' ');
+    var ascii = Array.from(chunk, function(b) { return (b >= 32 && b <= 126) ? String.fromCharCode(b) : '.'; }).join('');
+    lines.push(offset + '  ' + hex.padEnd(48) + '  ' + ascii);
+  }
+  return lines.join('\n');
+}
+
+async function previewCard(binUrl, name, uid) {
+  document.getElementById('cardPreviewTitle').textContent = (name || uid || '卡片') + ' 数据';
+  var div = document.getElementById('cardPreviewHex');
+  if (!binUrl) {
+    div.innerHTML = '<div style="color:#64748b;padding:20px;text-align:center">无二进制数据</div>';
+  } else {
+    div.innerHTML = '<div style="color:#64748b;padding:20px;text-align:center">加载中...</div>';
+    try {
+      var res = await fetch(binUrl);
+      if (!res.ok) throw new Error('load failed');
+      var buf = await res.arrayBuffer();
+      var bytes = new Uint8Array(buf);
+      if (isTextDump(bytes)) {
+        bytes = parseChameleonDump(new TextDecoder().decode(bytes));
+      }
+      div.innerHTML = formatMifareHex(bytes);
+    } catch(e) {
+      div.innerHTML = '<div style="color:#f87171;padding:20px;text-align:center">加载失败: ' + e.message + '</div>';
+    }
+  }
+  document.getElementById('cardPreviewModal').classList.remove('hidden');
+}
+
+function hideCardPreview() {
+  document.getElementById('cardPreviewModal').classList.add('hidden');
+}
+
+async function showUserModal() {
+  document.getElementById('userModal').classList.remove('hidden');
+  document.getElementById('userErr').style.display = 'none';
+  await refreshUserList();
+}
+
+function hideUserModal() {
+  document.getElementById('userModal').classList.add('hidden');
+}
+
+async function refreshUserList() {
+  try {
+    const users = await api('/api/users');
+    var html = '';
+    for (var i = 0; i < users.length; i++) {
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)">';
+      html += '<div><div style="font-size:15px;font-weight:500">' + users[i].username + '</div><div style="font-size:12px;color:var(--text-secondary)">' + (users[i].created_at || '-') + '</div></div>';
+      if (users.length > 1) {
+        html += '<button class="btn btn-danger" onclick="deleteUser(\'' + users[i].username + '\')">删除</button>';
+      }
+      html += '</div>';
+    }
+    document.getElementById('userList').innerHTML = html;
+  } catch(e) {
+    document.getElementById('userList').innerHTML = '<div style="color:var(--danger)">加载失败</div>';
+  }
+}
+
+async function addUser() {
+  const username = document.getElementById('newUsername').value.trim();
+  const password = document.getElementById('newPassword').value.trim();
+  if (!username || !password) {
+    document.getElementById('userErr').textContent = '用户名和密码不能为空';
+    document.getElementById('userErr').style.display = 'block';
+    return;
+  }
+  try {
+    await api('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    document.getElementById('newUsername').value = '';
+    document.getElementById('newPassword').value = '';
+    document.getElementById('userErr').style.display = 'none';
+    toast('用户已添加');
+    await refreshUserList();
+  } catch(e) {
+    document.getElementById('userErr').textContent = e.message;
+    document.getElementById('userErr').style.display = 'block';
+  }
+}
+
+async function deleteUser(username) {
+  if (!confirm('确定要删除用户 ' + username + ' 吗？')) return;
+  try {
+    await api('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
+    toast('用户已删除');
+    await refreshUserList();
+  } catch(e) {
+    toast('删除失败: ' + e.message);
+  }
+}
+
 (async function init() {
   try {
     const s = await api('/api/session');
     if (s.logged_in) {
+      document.getElementById('headerUser').textContent = s.username;
+      if (s.is_admin) {
+        document.getElementById('btnUserMgmt').style.display = '';
+      }
       document.getElementById('loginOverlay').style.display = 'none';
       document.getElementById('app').classList.add('visible');
       loadCards();
